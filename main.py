@@ -4,94 +4,79 @@ import time
 from prometheus_client import start_http_server, Gauge
 
 # ========================
-# Prometheus监控指标定义
+# Prometheus指标注册
 # ========================
-cpu_temp_gauge = Gauge('cpu_temperature', 'Current CPU temperature in Celsius')
-nvme_temp_gauge = Gauge('nvme_temperature', 'Current NVMe temperature in Celsius')
-network_temp_gauge = Gauge('network_temperature', 'Current network temperature in Celsius')
-t5ssd_temp_gauge = Gauge('t5ssd_temperature', 'Samsung T5 SSD temperature in Celsius')
+METRICS = {
+    'cpu_temperature': Gauge('cpu_temperature', 'CPU温度 (Tctl)', ['chip']),
+    'nvme_temperature': Gauge('nvme_temperature', 'NVMe复合温度', ['device']),
+    'network_temperature': Gauge('network_temperature', '无线网卡温度', ['interface']),
+    'ssd_temperature': Gauge('ssd_temperature', '外置SSD温度', ['model'])
+}
 
 # ========================
-# 传感器数据获取函数
+# 传感器数据统一获取
 # ========================
-def get_cpu_temperature():
+def get_sensor_data():
     try:
-        output = subprocess.check_output(["sensors", "-j"]).decode()
-        sensors_data = json.loads(output.replace("Â", ""))
-        return sensors_data.get('k10temp-pci-00c3', {}).get('Tctl', {}).get('temp1_input')
-    except Exception:
+        output = subprocess.check_output(["sensors", "-j"], timeout=3).decode()
+        return json.loads(output.replace("Â", ""))
+    except Exception as e:
+        METRICS['cpu_temperature'].labels('k10temp').set(-1)  # 错误状态标记
         return None
 
-def get_nvme_temperature():
-    try:
-        output = subprocess.check_output(["sensors", "-j"]).decode()
-        sensors_data = json.loads(output.replace("Â", ""))
-        return sensors_data.get('nvme-pci-0400', {}).get('Composite', {}).get('temp1_input')
-    except Exception:
-        return None
-
-def get_network_temperature():
-    try:
-        output = subprocess.check_output(["sensors", "-j"]).decode()
-        sensors_data = json.loads(output.replace("Â", ""))
-        return sensors_data.get('mt7921_phy0-pci-0300', {}).get('temp1', {}).get('temp1_input')
-    except Exception:
-        return None
-
-def get_t5ssd_temperature(device='/dev/sda'):
-    """获取T5 SSD温度，支持自动重试机制"""
-    retries = 3
-    for attempt in range(retries):
-        try:
-            output = subprocess.check_output(
-                ["smartctl", "-a", "-j", device],
-                stderr=subprocess.STDOUT
-            ).decode()
-            smart_data = json.loads(output)
-            
-            # 双重校验温度数据有效性
-            if (temp := smart_data.get('temperature', {}).get('current')) is not None:
-                if -40 <= temp <= 150:
-                    return temp
-            return None
-            
-        except subprocess.CalledProcessError:
-            time.sleep(1)
-        except json.JSONDecodeError:
-            time.sleep(1)
-        except KeyError:
-            time.sleep(1)
-    return None
+# ========================
+# 温度解析专用方法
+# ========================
+def parse_temperature(data, path):
+    """通用温度解析方法，路径格式：chip.key1.key2"""
+    keys = path.split('.')
+    value = data
+    for key in keys:
+        value = value.get(key, {})
+    return float(value) if isinstance(value, (int, float)) else None
 
 # ========================
-# 指标收集主函数
+# SSD温度监控专用方法
 # ========================
-def collect_metrics():
-    if (cpu_temp := get_cpu_temperature()) is not None:
-        cpu_temp_gauge.set(cpu_temp)
+def get_ssd_temp(device='/dev/sda'):
+    try:
+        output = subprocess.check_output(
+            ["sudo", "smartctl", "-j", "-A", device],
+            timeout=5, stderr=subprocess.DEVNULL
+        )
+        data = json.loads(output)
+        return data.get('temperature', {}).get('current')
+    except:
+        return None
+
+# ========================
+# 指标收集主逻辑
+# ========================
+def collect():
+    sensor_data = get_sensor_data()
     
-    if (nvme_temp := get_nvme_temperature()) is not None:
-        nvme_temp_gauge.set(nvme_temp)
-    
-    if (network_temp := get_network_temperature()) is not None:
-        network_temp_gauge.set(network_temp)
-    
-    if (ssd_temp := get_t5ssd_temperature()) is not None:
-        t5ssd_temp_gauge.set(ssd_temp)
+    # CPU温度（AMD Tctl）
+    if sensor_data:
+        cpu_temp = parse_temperature(sensor_data, 'k10temp-pci-00c3.Tctl.temp1_input')
+        METRICS['cpu_temperature'].labels('k10temp').set(cpu_temp or 0)
         
+        # NVMe复合温度
+        nvme_temp = parse_temperature(sensor_data, 'nvme-pci-0400.Composite.temp1_input') 
+        METRICS['nvme_temperature'].labels('nvme0').set(nvme_temp or 0)
+        
+        # 无线网卡温度
+        wifi_temp = parse_temperature(sensor_data, 'mt7921_phy0-pci-0300.temp1.temp1_input')
+        METRICS['network_temperature'].labels('wlan0').set(wifi_temp or 0)
+    
+    # 外置SSD温度
+    if (ssd_temp := get_ssd_temp()) is not None:
+        METRICS['ssd_temperature'].labels('Samsung_T5').set(ssd_temp)
+
 # ========================
-# 主程序入口
+# 服务启动
 # ========================
 if __name__ == "__main__":
     start_http_server(9300)
-    
-    collect_metrics()
-    
     while True:
-        try:
-            time.sleep(5)
-            collect_metrics()
-        except KeyboardInterrupt:
-            break
-        except Exception:
-            time.sleep(10)
+        collect()
+        time.sleep(5)
